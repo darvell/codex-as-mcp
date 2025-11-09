@@ -28,6 +28,14 @@ from mcp.server.fastmcp import FastMCP, Context
 # Chosen to be long to accommodate non-trivial editing tasks.
 DEFAULT_TIMEOUT_SECONDS: int = 8 * 60 * 60  # 8 hours
 
+# Valid models and their reasoning levels
+VALID_MODELS = ["gpt-5", "gpt-5-codex", "gpt-5-codex-mini"]
+REASONING_LEVELS = {
+    "gpt-5": ["minimal", "low", "medium", "high"],
+    "gpt-5-codex": ["low", "medium", "high"],
+    "gpt-5-codex-mini": ["medium", "high"],
+}
+
 
 mcp = FastMCP("codex-subagent")
 
@@ -51,23 +59,72 @@ def _resolve_codex_executable() -> str:
 
 
 @mcp.tool()
-async def spawn_agent(ctx: Context, prompt: str) -> str:
-    """Spawn a Codex agent to work inside the current working directory.
+async def spawn_agent(
+    ctx: Context, prompt: str, model: str, reasoning_level: str
+) -> str:
+    """Spawn a Codex agent with the right model and reasoning level for the task.
 
-    The server resolves the working directory via ``os.getcwd()`` so it inherits
-    whatever environment the MCP process currently has.
+    **Model Selection - Pick the right tool:**
+
+    • gpt-5 - The Strategic Thinker
+      For thinking outside the codebase: planning, research, exploring approaches,
+      architectural decisions, understanding vague requirements, creative problem-solving.
+      Use when you need broad world knowledge or to navigate ambiguous spaces.
+
+    • gpt-5-codex - The Senior Engineer
+      For deep software engineering: complex implementation, refactoring, debugging,
+      understanding intricate code, system analysis. Can explore ideas through an
+      engineering lens. Your go-to for serious coding work.
+
+    • gpt-5-codex-mini - The Focused Implementer
+      For concrete, well-defined tasks where the path is clear. Great at executing
+      straightforward implementations, simple refactors, routine work. Not ideal for
+      abstract or ambiguous problems - works best with clear requirements.
+
+    **Reasoning Levels:**
+
+    For gpt-5 (minimal | low | medium | high):
+    • minimal: Quick straightforward queries
+    • low: Simple tasks
+    • medium: General purpose, solid default
+    • high: Complex or ambiguous problems needing deep thought
+
+    For gpt-5-codex (low | medium | high):
+    • low: Clear-cut engineering tasks
+    • medium: Standard work, good default
+    • high: Tricky problems, complex refactors, use freely when helpful
+
+    For gpt-5-codex-mini (medium | high):
+    • medium: Standard implementation, good default
+    • high: When you want extra care on details
+
+    Note: Don't overthink reasoning levels - 'high' is there to use when you want
+    deeper thinking. Medium is a solid default, but high is fine to reach for.
 
     Args:
-        prompt: All instructions/context the agent needs for the task.
+        prompt: Complete instructions and context for the agent's task.
+        model: gpt-5 | gpt-5-codex | gpt-5-codex-mini
+        reasoning_level: See above for options per model.
 
     Returns:
-        The agent's final response (clean output from Codex CLI).
+        The agent's final response from Codex CLI.
     """
     # Basic validation to avoid confusing UI errors
     if not isinstance(prompt, str):
         return "Error: 'prompt' must be a string."
     if not prompt.strip():
         return "Error: 'prompt' is required and cannot be empty."
+
+    # Validate model
+    if model not in VALID_MODELS:
+        return (
+            f"Error: Invalid model '{model}'. Must be one of: {', '.join(VALID_MODELS)}"
+        )
+
+    # Validate reasoning level for the model
+    valid_levels = REASONING_LEVELS.get(model, [])
+    if reasoning_level not in valid_levels:
+        return f"Error: Invalid reasoning_level '{reasoning_level}' for model '{model}'. Valid levels: {', '.join(valid_levels)}"
 
     try:
         codex_exec = _resolve_codex_executable()
@@ -90,6 +147,10 @@ async def spawn_agent(ctx: Context, prompt: str) -> str:
             work_directory,
             "--skip-git-repo-check",
             "--full-auto",
+            "-m",
+            model,
+            "-c",
+            f"model_reasoning_effort={reasoning_level}",
             "--output-last-message",
             str(output_path),
             quoted_prompt,
@@ -159,26 +220,41 @@ async def spawn_agent(ctx: Context, prompt: str) -> str:
 
 @mcp.tool()
 async def spawn_agents_parallel(
-    ctx: Context,
-    agents: list[dict[str, str]]
+    ctx: Context, agents: list[dict[str, str]]
 ) -> list[dict[str, str]]:
-    """Spawn multiple Codex agents in parallel.
+    """Spawn multiple Codex agents in parallel - each task gets its own model and reasoning level.
 
-    Each spawned agent reuses the server's current working directory
-    (``os.getcwd()``).
+    Mix and match models based on what each task needs. See spawn_agent for full guidance.
 
     Args:
-        agents: List of agent specs, each with a 'prompt' entry.
-                Example: [
-                    {"prompt": "Create math.md"},
-                    {"prompt": "Create story.md"}
+        agents: List of agent specs with 'prompt', 'model', and 'reasoning_level'.
+
+                Example - different tools for different jobs:
+                [
+                    {
+                        "prompt": "Research approaches for implementing rate limiting",
+                        "model": "gpt-5",
+                        "reasoning_level": "high"
+                    },
+                    {
+                        "prompt": "Implement the rate limiter with redis backend",
+                        "model": "gpt-5-codex",
+                        "reasoning_level": "high"
+                    },
+                    {
+                        "prompt": "Add JSDoc comments to utils/format.js",
+                        "model": "gpt-5-codex-mini",
+                        "reasoning_level": "medium"
+                    }
                 ]
 
     Returns:
-        List of results with 'index', 'output', and optional 'error' fields.
+        List of results with 'index' and either 'output' or 'error' for each agent.
     """
     if not isinstance(agents, list):
-        return [{"index": "0", "error": "Error: 'agents' must be a list of agent specs."}]
+        return [
+            {"index": "0", "error": "Error: 'agents' must be a list of agent specs."}
+        ]
 
     if not agents:
         return [{"index": "0", "error": "Error: 'agents' list cannot be empty."}]
@@ -190,23 +266,40 @@ async def spawn_agents_parallel(
             if not isinstance(spec, dict):
                 return {
                     "index": str(index),
-                    "error": f"Agent {index}: spec must be a dictionary with a 'prompt' field."
+                    "error": f"Agent {index}: spec must be a dictionary with 'prompt', 'model', and 'reasoning_level' fields.",
                 }
 
             prompt = spec.get("prompt", "")
+            model = spec.get("model", "")
+            reasoning_level = spec.get("reasoning_level", "")
+
+            # Validate required fields
+            if not prompt:
+                return {
+                    "index": str(index),
+                    "error": f"Agent {index}: 'prompt' is required.",
+                }
+            if not model:
+                return {
+                    "index": str(index),
+                    "error": f"Agent {index}: 'model' is required.",
+                }
+            if not reasoning_level:
+                return {
+                    "index": str(index),
+                    "error": f"Agent {index}: 'reasoning_level' is required.",
+                }
 
             # Report progress for this agent
             try:
                 await ctx.report_progress(
-                    index,
-                    len(agents),
-                    f"Starting agent {index + 1}/{len(agents)}..."
+                    index, len(agents), f"Starting agent {index + 1}/{len(agents)}..."
                 )
             except Exception:
                 pass
 
             # Run the agent
-            output = await spawn_agent(ctx, prompt)
+            output = await spawn_agent(ctx, prompt, model, reasoning_level)
 
             # Check if output contains an error
             if output.startswith("Error:"):
@@ -225,7 +318,9 @@ async def spawn_agents_parallel(
     final_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            final_results.append({"index": str(i), "error": f"Unexpected error: {str(result)}"})
+            final_results.append(
+                {"index": str(i), "error": f"Unexpected error: {str(result)}"}
+            )
         else:
             final_results.append(result)
 
